@@ -1,16 +1,18 @@
 from datetime import datetime, timezone
 from pymongo import MongoClient
-import config
 import re
 import requests
 import pandas as pd
-from config import api_pipedrive
+from datetime import datetime
+from dotenv import load_dotenv
+import os
 
-client = MongoClient(
-    f'mongodb+srv://{config.mongo_pat}',
-    tls=True,
-    tlsAllowInvalidCertificates=True
-)
+load_dotenv()
+
+mongo_pat = os.getenv('mongo_pat')
+api_pipedrive = os.getenv('api_pipedrive')
+
+client = MongoClient( f'mongodb+srv://{mongo_pat}',tls=True,tlsAllowInvalidCertificates=True)
 
 def get_conso():
     print("########### GET CONSO START ###########")
@@ -71,68 +73,67 @@ def get_conso():
     df = pd.DataFrame(result)
     df['societyName'] = df['societyName'].str.replace('+Simple', 'Plus Simple')
 
-    # Si la colonne _id contient des dictionnaires
+    # If the '_id' column exists, process it
     if '_id' in df.columns:
         df['_id'] = df['_id'].apply(lambda x: x if isinstance(x, dict) else {})
         df = df.join(pd.json_normalize(df['_id'])).drop(columns=['_id'])
 
-    # Renommer les colonnes
-    df.rename(columns={'societyId': 'societyId', 'yearMonth': 'yearMonth'}, inplace=True)
-
-    # Grouper par societyName et trier par yearMonth
-
+    # Convert 'yearMonth' to datetime format
     df['yearMonth'] = pd.to_datetime(df['yearMonth'], format='%Y-%m')
 
-    df = df.sort_values(by=['societyName', 'yearMonth'])
-
-    # Convertir yearMonth en datetime
-    df['yearMonth'] = pd.to_datetime(df['yearMonth'])
-
-    # Générer toutes les dates entre 2022-10-01 et 2024-09-01
-    all_dates = pd.date_range(start="2022-10-01", end="2024-09-01", freq='MS')
-
-    # Créer un DataFrame avec toutes les combinaisons de societyName, societyId, et yearMonth
-    society_info = df[['societyName', 'societyId']].drop_duplicates()
-    expanded_df = pd.DataFrame([(name, sid, date) for (name, sid) in society_info.values for date in all_dates],
-                               columns=['societyName', 'societyId', 'yearMonth'])
-
-    # Fusionner avec les données existantes
-    final_df = pd.merge(expanded_df, df, on=['societyName', 'societyId', 'yearMonth'], how='left')
-
-    # Remplir les colonnes N-1 et N
-    start_n1 = pd.to_datetime("2022-10-01")
-    end_n1 = pd.to_datetime("2023-09-30")
-    start_n = pd.to_datetime("2023-10-01")
-    end_n = pd.to_datetime("2024-09-30")
-
-    final_df['N-1'] = final_df.apply(lambda row: row['totalAmount'] if start_n1 <= row['yearMonth'] <= end_n1 else None,
-                                     axis=1)
-    final_df['N'] = final_df.apply(lambda row: row['totalAmount'] if start_n <= row['yearMonth'] <= end_n else None,
-                                   axis=1)
-
-    # Afficher le DataFrame final
-    final_df = final_df.drop(columns=['totalAmount'])
-    final_df[['N','N-1']] = final_df[['N','N-1']].astype(float)
-    import locale
-
-    # Paramétrer la locale pour le français
-    locale.setlocale(locale.LC_TIME, 'fr_FR.UTF-8')  # Pour les systèmes Linux/MacOS
-    # locale.setlocale(locale.LC_TIME, 'French_France.1252')  # Pour les systèmes Windows
-
-    # Ajouter une colonne 'Month' qui extrait le mois en toutes lettres
-    final_df['Month'] = final_df['yearMonth'].dt.strftime('%B')
-    final_df.drop(columns='yearMonth', inplace = True)
-
-    # Perform group by societyId and Month, and aggregate the data (e.g., sum or mean depending on context)
-    month_order = [
-        "octobre", "novembre", "décembre", "janvier", "février", "mars",
-        "avril", "mai", "juin", "juillet", "août", "septembre"
+    # Define months for expansion
+    months = [
+        "octobre", "novembre", "décembre", "janvier", "février", "mars", "avril",
+        "mai", "juin", "juillet", "août", "septembre"
     ]
-    final_df['Month'] = pd.Categorical(final_df['Month'], categories=month_order, ordered=True)
 
-    # Now, sort the grouped dataframe by societyId and Month
-    grouped_df = final_df.groupby(['societyName', 'societyId', 'Month'], observed=True).sum().reset_index()
+    # Extract unique societies
+    societies = df[['societyName', 'societyId']].drop_duplicates()
+
+    # Create a new dataframe where each society will have a row for each month
+    new_data = pd.DataFrame([(society, society_id, month)
+                             for society, society_id in zip(societies['societyName'], societies['societyId'])
+                             for month in months],
+                            columns=['societyName', 'societyId', 'mois'])
+
+    # Step 2: Convert month names to numerical values for merging with the original data
     month_mapping = {
+        "janvier": 1, "février": 2, "mars": 3, "avril": 4, "mai": 5, "juin": 6,
+        "juillet": 7, "août": 8, "septembre": 9, "octobre": 10, "novembre": 11, "décembre": 12
+    }
+
+    new_data['mois_num'] = new_data['mois'].map(month_mapping)
+
+    # Extract year and month from yearMonth column in the original dataframe
+    df['year'] = df['yearMonth'].dt.year
+    df['month'] = df['yearMonth'].dt.month
+
+    df['yearMonth'] = pd.to_datetime(df['yearMonth'], format='%Y-%m')
+    df.to_csv('csv/warning.csv')
+
+    # Now perform the merge including 'yearMonth' explicitly
+    df = new_data.merge(df[['societyName', 'societyId', 'year', 'month', 'totalAmount', 'yearMonth']],
+                        how='left',
+                        left_on=['societyName', 'societyId', 'mois_num'],
+                        right_on=['societyName', 'societyId', 'month'])
+
+    # Now apply the year range logic
+    ranges = {
+        "2022-2023": ("2022-10-01", "2023-09-30"),
+        "2023-2024": ("2023-10-01", "2024-09-30"),
+        "2024-2025": ("2024-10-01", "2025-09-30")
+    }
+
+    # Creating the new columns based on the defined ranges
+    for new_col, (start, end) in ranges.items():
+        start_date = pd.to_datetime(start)
+        end_date = pd.to_datetime(end)
+        df[new_col] = df.apply(lambda row: row['totalAmount'] if start_date <= row['yearMonth'] <= end_date else None,
+                               axis=1)
+
+
+    # Continue with renaming months and sorting
+    month_rename_mapping = {
         "octobre": "01-octobre",
         "novembre": "02-novembre",
         "décembre": "03-décembre",
@@ -147,10 +148,118 @@ def get_conso():
         "septembre": "12-septembre"
     }
 
-    # Apply the mapping to the 'Month' column
-    grouped_df['Month'] = grouped_df['Month'].map(month_mapping)
+    # Apply the month renaming
+    df['mois'] = df['mois'].replace(month_rename_mapping)
 
-    grouped_df.to_csv('csv/conso.csv', index=False)
+    # Convert 'yearMonth' column to datetime for easier manipulation
+    df['yearMonth'] = pd.to_datetime(df['yearMonth'], format='%Y-%m')
+
+    # Sort the DataFrame by societyId and yearMonth for consecutive month check
+    df = df.sort_values(by=['societyId', 'yearMonth'])
+
+    # Group the data by societyId to analyze consumption for each client
+    for societyId, group in df.groupby('societyId'):
+        group = group.sort_values(by='yearMonth')  # Ensure it's sorted by time
+
+        # Check for three consecutive months with zero or NaN in totalAmount
+        for i in range(len(group) - 2):
+            if group['totalAmount'].iloc[i:i + 3].fillna(0).sum() == 0:
+                df.loc[group.index[i:i + 3], 'warning'] = 3
+
+        # Check for two consecutive months with zero or NaN in totalAmount
+        for i in range(len(group) - 1):
+            if group['totalAmount'].iloc[i:i + 2].fillna(0).sum() == 0 and df.loc[group.index[i], 'warning'] == "":
+                df.loc[group.index[i:i + 2], 'warning'] = 2
+
+    def assign_range(row):
+        year_month = row['yearMonth']
+        for range_name, (start, end) in ranges.items():
+            start_date = pd.to_datetime(start)
+            end_date = pd.to_datetime(end)
+            if start_date <= year_month <= end_date:
+                return range_name
+        return None
+
+    # Apply the function to create a new column 'range'
+    df['range'] = df.apply(assign_range, axis=1)
+
+    # Sort by societyName and then by mois
+    sorted_data = df.sort_values(by=['societyName', 'mois'])
+
+    sorted_data = sorted_data.drop(columns=['mois_num', 'year', 'month','totalAmount'], errors='ignore')
+    sorted_data['yearMonth'] = sorted_data['yearMonth'].dt.strftime('%Y-%m')
+    sorted_data['mois'] = sorted_data['mois'].astype(str)
+
+    # Save the final sorted data to Excel
+    sorted_data.to_csv('csv/conso.csv', index=False)
+
+
+import pandas as pd
+
+
+def warning():
+    data = pd.read_csv("csv/warning.csv")
+
+    # Step 1: Ensure yearMonth is formatted as "YYYY-MM"
+    data['yearMonth'] = pd.to_datetime(data['yearMonth']).dt.strftime('%Y-%m')
+
+    # Step 2: Create a new column "warning_month" initialized to None
+    data['warning_month'] = None
+
+    # Step 3: Create a range of months for each societyId starting from Oct 2022 to the current month
+    min_month = pd.Timestamp.today() - pd.DateOffset(months=6)
+    current_month = pd.Timestamp.today().replace(day=1)
+
+    # Create a range of months for the last 6 months
+    all_months = pd.date_range(min_month, current_month, freq='MS').strftime('%Y-%m')
+
+    # Function to fill missing months with totalAmount = 0
+    def fill_missing_months(group):
+        # Get the existing months for the society
+        existing_months = group['yearMonth'].unique()
+        missing_months = [month for month in all_months if month not in existing_months]
+
+        # Create rows for missing months
+        missing_rows = pd.DataFrame({
+            'yearMonth': missing_months,
+            'totalAmount': 0,
+            'societyId': group['societyId'].iloc[0],
+            'societyName': group['societyName'].iloc[0],
+            'warning_month': None
+        })
+
+        # Append the missing rows and return
+        return pd.concat([group, missing_rows], ignore_index=True)
+
+    # Apply the function to fill missing months for each societyId
+    data_filled = data.groupby('societyId').apply(fill_missing_months).reset_index(drop=True)
+
+    # Step 4: Check for consecutive months with totalAmount = 0 only in the last 6 months
+    def set_warning_month(group):
+        # Sort the group by yearMonth and focus on the last 6 months
+        group = group[group['yearMonth'].isin(all_months)].sort_values(by='yearMonth')
+
+        # Calculate consecutive 0s in totalAmount, starting from the current month backwards
+        zero_streak = (group['totalAmount'] == 0).astype(int).groupby(group['totalAmount'].ne(0).cumsum()).cumsum()
+
+        # Set warning_month for the current month based on the zero_streak
+        current_row_index = group[group['yearMonth'] == current_month.strftime('%Y-%m')].index
+        if not current_row_index.empty:
+            streak_value = zero_streak.loc[current_row_index].values[0]
+            group.loc[current_row_index, 'warning_month'] = streak_value if streak_value >= 2 else None
+
+        return group
+
+    # Apply the warning logic for each societyId
+    data_final = data_filled.groupby('societyId').apply(set_warning_month).reset_index(drop=True)
+
+    # Keep only the relevant columns
+    columns_to_keep = ['totalAmount', 'societyName', 'societyId', 'yearMonth', 'year', 'month', 'warning_month']
+    final_data = data_final[columns_to_keep]
+
+    # Save the final data to a CSV file
+    final_data.to_csv('csv/warning.csv', index=False)
+
 
 def get_base():
     print("########### GET BASE START ###########")
@@ -248,10 +357,12 @@ def get_tarif():
     # Save DataFrame to CSV
     df.to_csv('csv/tarif.csv', index=False)
 
+from bson import ObjectId
+
 def get_entities():
     print("########### GET ENTITIES START ###########")
 
-    # Aggregation pipeline
+    # Agrégation initiale pour extraire les entités
     result = client['legacy-api-management']['societies'].aggregate(
         [
             {
@@ -260,25 +371,26 @@ def get_entities():
             '$project': {
                 'name': 1,
                 '_id': 1,
-                "raison" : "$billings.raison",
-                "address" : "$billings.address.label",
-                "service" : "$billings.service",
-                "mandatId" : "$billings.mandatId",
-                "mandat_status" : "$billings.status",
-                "amex" : "$settings.amex.cardHolderName",
+                "raison": "$billings.raison",
+                "address": "$billings.address.label",
+                "service": "$billings.service",
+                "mandatId": "$billings.mandatId",
+                "mandat_status": "$billings.status",
+                "amex": "$settings.amex.cardHolderName",
+                "billing_id": "$billings._id"  # Ajout de billings._id pour la recherche ultérieure
             }
         }
         ]
     )
 
-    # Convert result to DataFrame
+    # Convertir le résultat en DataFrame
     df = pd.DataFrame(list(result))
 
-    # Replace '+Simple' with 'Plus Simple' in 'name' column
+    # Remplacer '+Simple' par 'Plus Simple' dans la colonne 'name'
     df['name'] = df['name'].str.replace('+Simple', 'Plus Simple')
     df.rename(columns={'_id': 'societyId', 'name': 'societyName'}, inplace=True)
 
-    # Création de la colonne "payment" avec les conditions
+    # Fonction pour créer la colonne "payment"
     def remplir_payment(row):
         if pd.notna(row['mandatId']) and pd.isna(row['amex']):
             return "mandat"
@@ -287,12 +399,139 @@ def get_entities():
         else:
             return "virement"
 
-    # Appliquer la fonction à chaque ligne du DataFrame pour créer une nouvelle colonne "payment"
+    # Appliquer la fonction à chaque ligne pour la colonne "payment"
     df['payment'] = df.apply(remplir_payment, axis=1)
 
+    # Supprimer la colonne 'billing_id' si elle n'est plus nécessaire
+    df.drop(columns=['billing_id'], inplace=True)
 
-    # Save DataFrame to CSV
+    # Sauvegarder le DataFrame en CSV
     df.to_csv('csv/entities.csv', index=False)
+
+    print("CSV saved successfully.")
+
+
+def get_entities_unactive():
+    print("########### GET UPDATEDRIVE START ###########")
+
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    import pandas as pd
+    from pymongo import MongoClient
+    from bson import ObjectId
+
+    # Pipeline d'agrégation pour récupérer les données de MongoDB
+    pipeline = [
+        {
+            '$match': {
+                'status': 'unactive'
+            }
+        },
+        {
+            '$addFields': {
+                'companyIdAsObjectId': {'$toObjectId': '$companyId'}
+            }
+        },
+        {
+            '$lookup': {
+                'from': 'societies',
+                'localField': 'companyIdAsObjectId',
+                'foreignField': '_id',
+                'as': 'company_info'
+            }
+        },
+        {
+            '$unwind': '$company_info'
+        },
+        {
+            '$project': {
+                '_id': 1,  # Inclure _id
+                'name': '$company_info.name',  # Inclure name de la collection societies
+                'raison': 1,  # Inclure raison
+                'address': '$address.label',  # Inclure adresse
+                'status': 1,
+
+
+                # Inclure status
+
+
+            }
+        }
+    ]
+
+    # Exécution de l'agrégation
+    results = list(client['legacy-api-management']['billings'].aggregate(pipeline))
+
+    # Transformation des résultats en DataFrame pandas
+    df = pd.DataFrame(results)
+
+    # Conversion des ObjectId en chaînes de caractères
+    df['_id'] = df['_id'].astype(str)
+
+    # Réorganisation des colonnes dans l'ordre souhaité
+    df = df[['_id', 'name', 'raison', 'address', 'status']]
+
+    # ID de votre feuille Google Sheets
+    SPREADSHEET_ID = '1TI28QrhQ63i2bYgbOj4QFdriecANSalxXCZx3LEPCr8'
+
+    # Onglet pour les entités inactives
+    SHEET_NAME_UNACTIVE = 'Entities_Unactive'
+
+    # Onglet pour les entités actives (nouvel onglet)
+    SHEET_NAME_ACTIVE = 'Entities_Active'
+
+    # Authentification Google Sheets
+    SERVICE_ACCOUNT_FILE = 'creds/n8n-api-311609-115ae3a49fd9.json'
+    SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+
+    credentials = service_account.Credentials.from_service_account_file(
+        SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+    service = build('sheets', 'v4', credentials=credentials)
+
+    # Convertir le DataFrame des entités inactives en une liste de listes
+    values_unactive = df.values.tolist()
+    values_unactive.insert(0, df.columns.tolist())  # Ajouter les noms de colonnes en haut
+
+    # Préparation des données pour les entités inactives
+    body_unactive = {
+        'values': values_unactive
+    }
+
+    # Mise à jour de l'onglet des entités inactives
+    result_unactive = service.spreadsheets().values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=SHEET_NAME_UNACTIVE,
+        valueInputOption='RAW',
+        body=body_unactive
+    ).execute()
+
+    print(f"{result_unactive.get('updatedCells')} cellules mises à jour dans '{SHEET_NAME_UNACTIVE}'.")
+
+    # Charger le fichier CSV entities.csv dans un DataFrame
+    df_entity = pd.read_csv('csv/entities.csv')
+
+    # Nettoyer les données en remplaçant les NaN par une chaîne vide
+    df_entity = df_entity.fillna('')
+
+    # Convertir le DataFrame en une liste de listes
+    values_active = df_entity.values.tolist()
+    values_active.insert(0, df_entity.columns.tolist())  # Ajouter les noms de colonnes en haut
+
+    # Préparation des données pour les entités actives
+    body_active = {
+        'values': values_active
+    }
+
+    # Mise à jour de l'onglet pour les entités actives
+    result_active = service.spreadsheets().values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=SHEET_NAME_ACTIVE,  # Écrire dans un autre onglet
+        valueInputOption='RAW',
+        body=body_active
+    ).execute()
+
+    print(f"{result_active.get('updatedCells')} cellules mises à jour dans '{SHEET_NAME_ACTIVE}'.")
+
 
 def get_portefeuille():
     print("########### GET PORTEFEUILLE START ###########")
@@ -320,6 +559,8 @@ def get_portefeuille():
         golive = str(org['24582ea974bfcb46c1985c3350d33acab5e54246'])[:10]
         signature = org['af6c7d5ca6bec13a3a2ac0ffe4f05ed98907c412']
         awarde = org['446585f9020fe3190ca0fa5ef53fc429ef4b4441']
+        churn = org['eda2124e4e8bed55f7f2642cf3b5238d4bfccd58']
+        fin_contrat = org['7381f1cd157f298aaf3b74f90f23cdb8a7cacda3']
         account_info = org.get('e058ea93145bdf66d23b89dfab0d8f74178bb23b', {})
         account_name = account_info.get('name') if account_info else None
 
@@ -329,8 +570,10 @@ def get_portefeuille():
             'company_status': actif,
             'company_golive': golive,
             'signature': signature,
+            'fin_contrat': fin_contrat,
             'awarde': awarde,
-            'account': account_name
+            'account': account_name,
+            'churn': churn
         })
 
     df = pd.DataFrame(data)
@@ -359,6 +602,26 @@ def variation():
 
     df.to_csv('csv/conso.csv', index=False)
 
+def merge_all():
+    import pandas as pd
+
+    # Load the three CSV files
+    conso_df = pd.read_csv('csv/conso.csv')
+    base_df = pd.read_csv('csv/base.csv')
+    pipe_all_df = pd.read_csv('csv/pipe_all.csv')
+
+    # Merge the three DataFrames on 'societyId', giving priority to 'conso'
+    merged_df = conso_df.merge(base_df, on='societyId', how='left').merge(pipe_all_df, on='societyId', how='left')
+
+    # Drop duplicate columns if any (keeping the first occurrence)
+    merged_df = merged_df.loc[:, ~merged_df.columns.duplicated()]
+
+    # Save the merged result to a new CSV file
+    merged_df.to_csv('csv/merged_result.csv', index=False)
+
+    # Display the first few rows of the merged DataFrame
+    merged_df.head()
+
 
 def update_drive():
     print("########### GET UPDATEDRIVE START ###########")
@@ -368,7 +631,7 @@ def update_drive():
     import pandas as pd
 
     # Liste des tuples contenant les paires de (nom_fichier_csv, plage_sheet)
-    list = [('conso.csv', 'conso_updated'), ('pipe_all.csv', 'pipe'), ('base.csv', 'base'),('tarif.csv', 'tarif_nego'),('entities.csv', 'entities')]
+    list = [('merged_result.csv', 'conso_updated'),('tarif.csv', 'tarif_nego'),('warning.csv', 'warning'),('entities.csv', 'entities'),('entities_unactive.csv', 'entities_unactive')]
 
     # Fichier de compte de service et les scopes de l'API
     SERVICE_ACCOUNT_FILE = 'creds/n8n-api-311609-115ae3a49fd9.json'
@@ -376,7 +639,7 @@ def update_drive():
 
     def sheet_upt(filename, sheet_range):
         # ID de votre feuille Google Sheets
-        SPREADSHEET_ID = '1Ybw4aicEo2IgzxSYKWbDpZ3afW8GrjdzIeBhcrWNnGY'
+        SPREADSHEET_ID = '17VFyCP-CKmNl1X1BRVdc0jNjC4o9hyAopRrb5fITAK8'
 
         # Authentification et construction du service Google Sheets
         credentials = service_account.Credentials.from_service_account_file(
@@ -386,6 +649,23 @@ def update_drive():
         # Lecture du DataFrame pivoté
         df = pd.read_csv(f'csv/{filename}')
         df = df.astype(str).replace('nan', '')
+
+        if 'sub_price' in df.columns:
+            df['sub_price'] = pd.to_numeric(df['sub_price'], errors='coerce')
+
+        if '2022-2023' in df.columns:
+            df['2022-2023'] = pd.to_numeric(df['2022-2023'], errors='coerce')
+
+        if '2023-2024' in df.columns:
+            df['2023-2024'] = pd.to_numeric(df['2023-2024'], errors='coerce')
+
+        if '2024-2025' in df.columns:
+            df['2024-2025'] = pd.to_numeric(df['2024-2025'], errors='coerce')
+
+        # Remplacer les NaN par des chaînes vides pour éviter des erreurs dans l'API Google Sheets
+        df = df.fillna("")
+
+        df = df[df.columns.drop(df.filter(regex='_x$|_y$').columns)]
 
         # Convertir le DataFrame en une liste de listes (comme attendu par l'API Google Sheets)
         values = df.values.tolist()
