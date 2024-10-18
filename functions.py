@@ -6,9 +6,17 @@ import pandas as pd
 from datetime import datetime
 from dotenv import load_dotenv
 import os
+import os.path
+import base64
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 load_dotenv()
-
 mongo_pat = os.getenv('mongo_pat')
 api_pipedrive = os.getenv('api_pipedrive')
 
@@ -194,9 +202,6 @@ def get_conso():
     sorted_data.to_csv('csv/conso.csv', index=False)
 
 
-import pandas as pd
-
-
 def warning():
     data = pd.read_csv("csv/warning.csv")
 
@@ -254,12 +259,27 @@ def warning():
     data_final = data_filled.groupby('societyId').apply(set_warning_month).reset_index(drop=True)
 
     # Keep only the relevant columns
-    columns_to_keep = ['totalAmount', 'societyName', 'societyId', 'yearMonth', 'year', 'month', 'warning_month']
+    columns_to_keep = ['totalAmount', 'societyName', 'societyId', 'yearMonth', 'warning_month']
     final_data = data_final[columns_to_keep]
 
-    # Save the final data to a CSV file
-    final_data.to_csv('csv/warning.csv', index=False)
+    # Step 5: Filter results and keep only one societyName if warning is present
+    def filter_max_warning(group):
+        # Keep only rows where warning_month is not None
+        group_with_warning = group.dropna(subset=['warning_month'])
 
+        # If there are any rows with a warning, select the one with the highest warning_month
+        if not group_with_warning.empty:
+            max_warning_row = group_with_warning.loc[group_with_warning['warning_month'].idxmax()]
+            return pd.DataFrame([max_warning_row])
+        else:
+            # If no warnings are present, return nothing (empty DataFrame)
+            return pd.DataFrame()
+
+    # Apply the filter to keep only the max warning per society
+    filtered_data = data_final.groupby('societyId').apply(filter_max_warning).reset_index(drop=True)
+
+    # Save the final filtered data to a CSV file
+    filtered_data.to_csv('csv/warning.csv', index=False)
 
 def get_base():
     print("########### GET BASE START ###########")
@@ -357,8 +377,6 @@ def get_tarif():
     # Save DataFrame to CSV
     df.to_csv('csv/tarif.csv', index=False)
 
-from bson import ObjectId
-
 def get_entities():
     print("########### GET ENTITIES START ###########")
 
@@ -409,7 +427,6 @@ def get_entities():
     df.to_csv('csv/entities.csv', index=False)
 
     print("CSV saved successfully.")
-
 
 def get_entities_unactive():
     print("########### GET UPDATEDRIVE START ###########")
@@ -532,7 +549,6 @@ def get_entities_unactive():
 
     print(f"{result_active.get('updatedCells')} cellules mises à jour dans '{SHEET_NAME_ACTIVE}'.")
 
-
 def get_portefeuille():
     print("########### GET PORTEFEUILLE START ###########")
 
@@ -622,7 +638,6 @@ def merge_all():
     # Display the first few rows of the merged DataFrame
     merged_df.head()
 
-
 def update_drive():
     print("########### GET UPDATEDRIVE START ###########")
 
@@ -689,4 +704,71 @@ def update_drive():
     # Boucle sur la liste des fichiers et plages
     for filename, sheet_range in list:
         sheet_upt(filename, sheet_range)
+
+def envoi_email(status,error):
+    SCOPES = ['https://www.googleapis.com/auth/gmail.send', 'https://www.googleapis.com/auth/gmail.readonly']
+
+    sender_email = 'ope@supertripper.com'
+    sender_name = 'Supertripper Reports'
+    recipient_email = "ope@supertripper.com"
+    subject = f'CONSO BILLS : CRON {status}'
+
+    # Construction du corps de l'e-mail
+    body = (
+        f'{error}'
+    )
+    creds_file = 'creds/cred_gmail.json'
+    token_file = 'token.json'
+    def authenticate_gmail():
+        """Authentifie l'utilisateur via OAuth 2.0 et retourne les credentials"""
+        creds = None
+        # Le token est stocké localement après la première authentification
+        if os.path.exists(token_file):
+            creds = Credentials.from_authorized_user_file(token_file, SCOPES)
+        # Si le token n'existe pas ou est expiré, on initie un nouveau flux OAuth
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                flow = InstalledAppFlow.from_client_secrets_file(creds_file, SCOPES)
+                creds = flow.run_local_server(port=0)
+            # Enregistrer le token pour des sessions futures
+            with open(token_file, 'w') as token:
+                token.write(creds.to_json())
+        return creds
+
+    def create_message_with_attachment(sender, sender_name, to, subject, message_text):
+        """Crée un e-mail avec une pièce jointe et un champ Cc"""
+        message = MIMEMultipart()
+        message['to'] = to
+        message['from'] = f'{sender_name} <{sender}>'
+        message['subject'] = subject
+
+        # Attacher le corps du texte
+        message.attach(MIMEText(message_text, 'plain'))
+
+        # Encoder le message en base64 pour l'envoi via l'API Gmail
+        raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
+        return {'raw': raw_message}
+
+    def send_email(service, user_id, message):
+        """Envoie un e-mail via l'API Gmail"""
+        try:
+            message = service.users().messages().send(userId=user_id, body=message).execute()
+            print(f"Message Id: {message['id']}")
+            return message
+        except HttpError as error:
+            print(f'An error occurred: {error}')
+            return None
+
+    # Authentifier l'utilisateur et créer un service Gmail
+    creds = authenticate_gmail()
+    service = build('gmail', 'v1', credentials=creds)
+
+    # Créer le message avec pièce jointe et copie
+    message = create_message_with_attachment(sender_email, sender_name, recipient_email, subject, body)
+
+    # Envoyer l'e-mail
+    send_email(service, 'me', message)
+    print("Mail envoyé pour vérif ")
 
